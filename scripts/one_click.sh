@@ -480,6 +480,10 @@ word_map:
   weak_hint_terms: []
   weak_hint_weight: 0.25
 
+raw_events:
+  db_path: ""
+  max_ingest_batch: 1000
+
 identity_semantics:
   enabled: false
   private_config_path: ""
@@ -620,6 +624,8 @@ reflection:
   thinking_mode: ""
   timezone: "Asia/Shanghai"
   daily_hour: 4
+  daily_min_memory_items: 5
+  daily_conversation_turn_limit: 0
   check_interval_minutes: 60
 
 dream:
@@ -843,7 +849,7 @@ print_client_guide() {
   fi
   printf '自我锚点用 breath(domain="self_anchor")，分段查用 breath(domain="self_anchor", query="关键词")。\n'
   printf '画像在 Dashboard 的 Persona/画像面板手动生成/刷新；profile_fact 需要证据 bucket/moment 后再确认。\n'
-  printf '暗房外部只暴露 darkroom_enter(note=..., visibility="active")，不会回显正文。\n'
+  printf '暗房默认读写同一个 active 房间草稿，new_room=true 才新开；darkroom_view 只有 completeness>=1 且解锁后才回显房间 revisions。\n'
   printf '完整工具说明见 docs/Tool Guide.md；Dashboard 桶列表可批量选择并删除普通记忆桶。\n'
 
   case "${DEPLOY_TARGET}" in
@@ -925,9 +931,12 @@ EOF
     Gateway portrait memory reads profile_fact by default and does not include ordinary anchors unless explicitly enabled.
 
   Darkroom:
-    External client tool lists should expose only darkroom_enter(note=..., visibility="active").
+    Use darkroom_continue_context(limit=3) only to read the current active room draft, continue private reflection, and judge completeness.
+    darkroom_enter note should default to first person; do not use third-person self-reference unless quoting external facts or Xiaoyu.
+    darkroom_enter updates the current active room draft by default; pass new_room=true to open a separate room.
+    External client tool lists should expose darkroom_enter(note=..., visibility="active", lock_for="6h", new_room=false) and read-only darkroom_view.
     visibility can be active / archived / retracted.
-    It does not echo note bodies; handoff shows only Darkroom Door status.
+    darkroom_view returns room revision contents only when visibility is active, completeness is 1, and the lock has expired.
 
   Dream Context:
     dream.surface_enabled controls breath() dream surfacing.
@@ -1244,8 +1253,8 @@ first_deploy() {
   user_display_name="$(prompt_text '用户显示名' '小雨')"
 
   local dehy_base_url dehy_model dehy_key
-  dehy_base_url="$(prompt_text '脱水/导入抽取 base_url' 'https://api.deepseek.com/v1')"
-  dehy_model="$(prompt_text '脱水/导入抽取模型' 'deepseek-chat')"
+  dehy_base_url="$(prompt_text '脱水/导入抽取 base_url' 'https://api.deepseek.com')"
+  dehy_model="$(prompt_text '脱水/导入抽取模型' 'deepseek-v4-flash')"
   dehy_key="$(prompt_secret '脱水模型 key（OMBRE_API_KEY，必填）' true)"
 
   local embedding_enabled embedding_base_url embedding_model embedding_key
@@ -1520,6 +1529,7 @@ safe_backup_label() {
 
 backup_current_deployment() {
   local label stamp archive_name archive tmp_archive
+  local service config_bind_source env_bind_source
   label="$(safe_backup_label "${1:-manual}")"
   stamp="$(date +%Y%m%d_%H%M%S)"
   archive_name="ombre_backup_${label}_${stamp}.tar.gz"
@@ -1544,13 +1554,23 @@ backup_current_deployment() {
     }
     printf '已写入备份：%s\n' "${archive}"
   else
+    service="${OMBRE_SERVICE:-ombre-brain}"
     archive="/state/backups/${archive_name}"
     run_target_shell "set -e; mkdir -p /state/backups; items=''; for item in /data /state /app/config.yaml /app/.env; do [ -e \"\$item\" ] && items=\"\$items \$item\"; done; if [ -z \"\$items\" ]; then echo '没有找到可备份的 /data /state /app/config.yaml /app/.env'; exit 1; fi; tar --exclude=/state/backups --exclude=state/backups -czf '/tmp/${archive_name}' \$items; cp '/tmp/${archive_name}' '${archive}'" || return 1
-    backup_file ".env"
-    backup_file "config.yaml"
+    if env_bind_source="$(ombre_compose_bind_source "${COMPOSE_FILE}" "${service}" "/app/.env")"; then
+      backup_file "${env_bind_source}"
+    else
+      backup_file ".env"
+    fi
+    if config_bind_source="$(ombre_compose_bind_source "${COMPOSE_FILE}" "${service}" "/app/config.yaml")"; then
+      backup_file "${config_bind_source}"
+    else
+      backup_file "config.yaml"
+    fi
     backup_file "${COMPOSE_FILE}"
     printf '已写入容器数据备份：%s\n' "${archive}"
-    printf '如果当前目录有 .env / config.yaml / compose，也已在宿主机备份。\n'
+    printf '宿主机中存在的实际 .env / config.yaml 挂载源和 compose 也已分别备份。\n'
+    ombre_validate_compose_file_bind "${COMPOSE_FILE}" "${service}" "/app/config.yaml" "config.yaml" || return 1
   fi
 }
 
@@ -2000,6 +2020,24 @@ migration_bucket_files_apply() {
   migration_bucket_files_prompt "迁移 buckets/comments 应用"
 }
 
+migration_darkroom_merge_active_once() {
+  migration_prepare_target "合并旧 darkroom active 条目为一个 room（建议只用一次）" || return 1
+  printf '这一步只处理 visibility=active 且没有 room_id 的旧 darkroom 条目。\n'
+  printf '已经有 room_id 的条目、archived、retracted 都不会改。\n'
+  printf '脚本会先备份 state/darkroom/entries.jsonl，再写入同一个 room_id 和 revision=1..n。\n'
+  if ! prompt_yes_no '确认执行这个一次性合并吗' 'n'; then
+    return 0
+  fi
+  if [[ "${DEPLOY_TARGET}" == "python" ]]; then
+    local python_cmd
+    python_cmd="$(detect_python_cmd)" || return 1
+    load_python_direct_env
+    PYTHONIOENCODING=utf-8 "${python_cmd}" scripts/migrate_darkroom_active_room.py --apply --yes
+  else
+    run_target_shell "PYTHONIOENCODING=utf-8 python scripts/migrate_darkroom_active_room.py --apply --yes"
+  fi
+}
+
 migration_menu() {
   local choice
   while true; do
@@ -2018,8 +2056,9 @@ migration_menu() {
     printf '11. 删除已迁移旧 feel\n'
     printf '12. 预演迁移 buckets/comments 到当前 v2\n'
     printf '13. 应用迁移 buckets/comments 到当前 v2\n'
+    printf '14. 合并旧 darkroom active 条目为一个 room（建议只用一次）\n'
     printf '0. 返回上一级\n'
-    if ! read -r -p '输入（0-13）：' choice; then
+    if ! read -r -p '输入（0-14）：' choice; then
       printf '\n'
       return 0
     fi
@@ -2037,8 +2076,9 @@ migration_menu() {
       11) migration_cleanup_feels_apply; pause ;;
       12) migration_bucket_files_plan; pause ;;
       13) migration_bucket_files_apply; pause ;;
+      14) migration_darkroom_merge_active_once; pause ;;
       0) return 0 ;;
-      *) printf '请输入 0-13。\n' ;;
+      *) printf '请输入 0-14。\n' ;;
     esac
   done
 }

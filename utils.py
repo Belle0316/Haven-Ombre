@@ -15,11 +15,104 @@ import uuid
 import yaml
 import logging
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 
 LOCAL_TZ = ZoneInfo("Asia/Shanghai")
+
+
+def _date_hint(year: int, month: int, day: int, label: str, tz=LOCAL_TZ) -> dict[str, str] | None:
+    try:
+        target = datetime(year, month, day, tzinfo=tz).date()
+    except ValueError:
+        return None
+    return {"date": target.isoformat(), "label": label}
+
+
+def _reference_now(now: datetime | None = None, tz=LOCAL_TZ) -> datetime:
+    if now is None:
+        return datetime.now(tz)
+    if now.tzinfo is None:
+        return now.replace(tzinfo=tz)
+    return now.astimezone(tz)
+
+
+def parse_human_date_reference(text: str, *, now: datetime | None = None, tz=LOCAL_TZ) -> dict[str, str] | None:
+    """Parse common human date references into YYYY-MM-DD."""
+    value = str(text or "").strip()
+    if not value:
+        return None
+    base = _reference_now(now, tz)
+
+    explicit = re.search(
+        r"(?<!\d)(20\d{2})\s*(?:[-/.]|年)\s*(\d{1,2})\s*(?:[-/.]|月)\s*(\d{1,2})\s*(?:日|号)?(?!\d)",
+        value,
+    )
+    if explicit:
+        year, month, day = (int(part) for part in explicit.groups())
+        return _date_hint(year, month, day, explicit.group(0), tz)
+
+    short_year = re.search(
+        r"(?<!\d)(\d{2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*(?:日|号)?",
+        value,
+    )
+    if short_year:
+        year, month, day = (int(part) for part in short_year.groups())
+        return _date_hint(2000 + year, month, day, short_year.group(0), tz)
+
+    month_day = re.search(r"(?<![\d年/-])(\d{1,2})\s*月\s*(\d{1,2})\s*(?:日|号)?", value)
+    if month_day:
+        month, day = (int(part) for part in month_day.groups())
+        return _date_hint(base.year, month, day, month_day.group(0), tz)
+
+    relative_days = [
+        ("大前天", -3),
+        ("前天", -2),
+        ("昨晚", -1),
+        ("昨天", -1),
+        ("昨日", -1),
+        ("今晚", 0),
+        ("今天", 0),
+    ]
+    for label, offset in relative_days:
+        if label in value:
+            return {"date": (base + timedelta(days=offset)).date().isoformat(), "label": label}
+    return None
+
+
+def strip_human_date_references(text: str) -> str:
+    """Remove human date references from a query before topic extraction."""
+    value = str(text or "")
+    patterns = [
+        r"(?<!\d)20\d{2}\s*(?:[-/.]|年)\s*\d{1,2}\s*(?:[-/.]|月)\s*\d{1,2}\s*(?:日|号)?(?!\d)",
+        r"(?<!\d)\d{2}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*(?:日|号)?",
+        r"(?<![\d年/-])\d{1,2}\s*月\s*\d{1,2}\s*(?:日|号)?",
+    ]
+    for pattern in patterns:
+        value = re.sub(pattern, " ", value)
+    for label in ("大前天", "前天", "昨晚", "昨天", "昨日", "今晚", "今天"):
+        value = value.replace(label, " ")
+    return value
+
+
+def local_date_key(value, *, tz=LOCAL_TZ) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        return text
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        explicit_hint = parse_human_date_reference(text, tz=tz)
+        if explicit_hint and not any(label in text for label in ("大前天", "前天", "昨晚", "昨天", "昨日", "今晚", "今天")):
+            return explicit_hint["date"]
+        match = re.match(r"^\d{4}-\d{2}-\d{2}", text)
+        return match.group(0) if match else ""
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(tz)
+    return parsed.date().isoformat()
 
 
 def load_config(config_path: str = None) -> dict:
@@ -37,7 +130,14 @@ def load_config(config_path: str = None) -> dict:
         "log_level": "INFO",
         "buckets_dir": os.path.join(os.path.dirname(os.path.abspath(__file__)), "buckets"),
         "state_dir": "",
-        "merge_threshold": 75,
+        "merge_threshold": 90,
+        "import": {
+            "chunk_target_tokens": 3500,
+            "extract_max_input_chars": 0,
+            "max_items_per_chunk": 5,
+            "max_tags": 6,
+            "max_tag_chars": 12,
+        },
         "write_path": {
             "semantic_search_timeout_seconds": 3,
         },
@@ -59,10 +159,10 @@ def load_config(config_path: str = None) -> dict:
             "user_aliases": ["对方"],
         },
         "dehydration": {
-            "model": "deepseek-chat",
-            "base_url": "https://api.deepseek.com/v1",
+            "model": "deepseek-v4-flash",
+            "base_url": "https://api.deepseek.com",
             "api_key": "",
-            "thinking_mode": "",
+            "thinking_mode": "disabled",
             "max_tokens": 1024,
             "temperature": 0.1,
         },
@@ -99,12 +199,21 @@ def load_config(config_path: str = None) -> dict:
         },
         "word_map": {
             "enabled": False,
+            "daily_rebuild_enabled": True,
+            "daily_rebuild_hour": 4,
+            "daily_rebuild_minute": 30,
+            "daily_rebuild_include_archive": False,
+            "daily_rebuild_check_interval_minutes": 15,
             "max_terms_per_bucket": 16,
             "edge_top_k": 10,
             "min_term_len": 2,
             "stopwords": [],
             "private_terms": [],
             "stopword_prefixes": [],
+        },
+        "raw_events": {
+            "db_path": "",
+            "max_ingest_batch": 1000,
         },
         "identity_semantics": {
             "enabled": False,
@@ -172,11 +281,20 @@ def load_config(config_path: str = None) -> dict:
             "skip_recent_rounds": 5,
             "cooldown_hours": 6,
             "cooldown_floor": 0.3,
+            "semantic_session_dedupe_enabled": True,
+            "semantic_session_dedupe_threshold": 0.90,
+            "semantic_session_dedupe_lexical_threshold": 0.82,
+            "memory_sentinel_enabled": True,
+            "domain_sentinel_enabled": True,
+            "domain_sentinel_model": "Qwen/Qwen3.5-4B",
+            "domain_sentinel_max_tokens": 260,
+            "domain_sentinel_enable_thinking": False,
             "inject_total_budget": 1200,
             "core_memory_budget": 0,
             "recent_context_budget": 300,
             "recalled_memory_budget": 400,
             "direct_render_mode": "auto",
+            "bucket_list_cache_ttl_seconds": 300,
             "portrait_memory_enabled": False,
             "portrait_memory_budget": 360,
             "portrait_memory_max_sources": 8,
@@ -185,6 +303,9 @@ def load_config(config_path: str = None) -> dict:
             "favorite_memory_budget": 0,
             "favorite_memory_max_cards": 1,
             "related_memory_budget": 220,
+            "operit_context_rewrite_enabled": False,
+            "active_reminders_enabled": True,
+            "active_reminder_inject_limit": 2,
             "core_memory_interval_rounds": 0,
             "current_inner_state_interval_rounds": 15,
             "relationship_weather_interval_rounds": 0,
@@ -207,10 +328,11 @@ def load_config(config_path: str = None) -> dict:
             "enabled": True,
             "profile_id": "default",
             "mode": "llm",
-            "base_url": "https://api.deepseek.com/v1",
-            "model": "deepseek-chat",
+            "base_url": "https://api.deepseek.com",
+            "model": "deepseek-v4-flash",
             "api_key": "",
-            "thinking_mode": "",
+            "thinking_mode": "disabled",
+            "json_response_format": True,
             "temperature": 0.1,
             "max_tokens": 500,
             "global_decay_hours": 168,
@@ -267,6 +389,8 @@ def load_config(config_path: str = None) -> dict:
             "max_tokens": 700,
             "timezone": "Asia/Shanghai",
             "daily_hour": 4,
+            "daily_min_memory_items": 5,
+            "daily_conversation_turn_limit": 12,
             "weekly_day": 0,
             "weekly_hour": 4,
             "check_interval_minutes": 60,
@@ -279,6 +403,26 @@ def load_config(config_path: str = None) -> dict:
             "diary_memory_extract_enabled": True,
             "diary_memory_extract_max_per_day": 1,
             "diary_memory_extract_min_confidence": 0.68,
+            "daily_chat_memory_mode": "review",
+            "daily_chat_memory_hour": 0,
+            "daily_chat_memory_turn_limit": 0,
+            "daily_chat_memory_max_per_day": 10,
+            "daily_chat_memory_min_confidence": 0.68,
+            "daily_chat_memory_review_max_per_day": 10,
+            "daily_chat_memory_review_min_confidence": 0.55,
+            "daily_chat_memory_summary_enabled": True,
+            "daily_chat_memory_summary_window_turns": 14,
+            "daily_chat_memory_summary_stride_turns": 7,
+            "daily_chat_memory_api_key_env": "",
+            "daily_chat_memory_base_url": "",
+            "daily_chat_memory_timeout_seconds": 180,
+            "daily_chat_memory_summary_model": "",
+            "daily_chat_memory_summary_max_tokens": 2200,
+            "daily_chat_memory_candidate_model": "",
+            "daily_chat_memory_candidate_max_tokens": 3200,
+            "daily_activity_summary_enabled": True,
+            "daily_activity_summary_turn_limit": 0,
+            "daily_activity_summary_max_tokens": 320,
         },
         "portrait": {
             "enabled": True,
@@ -301,13 +445,15 @@ def load_config(config_path: str = None) -> dict:
             "recent_buffer_max": 24,
             "staging_pool_max": 24,
             "candidate_max": 40,
+            "stable_history_max": 20,
+            "current_focus_days": 7,
         },
         "dream": {
             "enabled": True,
             "auto_enabled": True,
             "surface_enabled": True,
             "inject_enabled": False,
-            "retain_after_inject": False,
+            "retain_after_inject": True,
             "base_url": "https://api.deepseek.com",
             "model": "deepseek-v4-flash",
             "api_key": "",
@@ -324,6 +470,9 @@ def load_config(config_path: str = None) -> dict:
             "material_limit": 5,
             "old_echo_enabled": True,
             "old_echo_min_age_hours": 72,
+            "raw_residue_enabled": False,
+            "raw_residue_turns": 4,
+            "raw_residue_max_chars": 1500,
             "identity_anchor_id": "c0b8ddb7423e",
             "min_surface_age_hours": 3,
             "surface_threshold": 0.62,
@@ -526,6 +675,10 @@ def load_config(config_path: str = None) -> dict:
             if item.strip()
         ]
 
+    env_domain_sentinel_model = os.environ.get("OMBRE_DOMAIN_SENTINEL_MODEL", "")
+    if env_domain_sentinel_model:
+        config.setdefault("gateway", {})["domain_sentinel_model"] = env_domain_sentinel_model
+
     env_persona_api_key = os.environ.get("OMBRE_PERSONA_API_KEY", "")
     if env_persona_api_key:
         config.setdefault("persona", {})["api_key"] = env_persona_api_key
@@ -549,6 +702,10 @@ def load_config(config_path: str = None) -> dict:
     env_reflection_model = os.environ.get("OMBRE_REFLECTION_MODEL", "")
     if env_reflection_model:
         config.setdefault("reflection", {})["model"] = env_reflection_model
+
+    env_reflection_candidate_model = os.environ.get("OMBRE_REFLECTION_CANDIDATE_MODEL", "")
+    if env_reflection_candidate_model:
+        config.setdefault("reflection", {})["daily_chat_memory_candidate_model"] = env_reflection_candidate_model
 
     env_diary_mcp_url = os.environ.get("OMBRE_DIARY_MCP_URL", "")
     if env_diary_mcp_url:
@@ -643,6 +800,9 @@ def strip_wikilinks(text: str) -> str:
 
 
 _AFFECT_ANCHOR_RE = re.compile(r"(?ims)^###\s*affect_anchor\s*$.*?(?=^###\s+|\Z)")
+_FOLLOWUP_SECTION_RE = re.compile(
+    r"(?ims)^#{2,6}\s*(?:followup|followups|follow-up|followup_log|followups_log|followup-log|todo|to-do|todo_log|todo-log|next|后续|后续待办|后续记录|待办|待办事项|待办记录)\s*$.*?(?=^#{2,6}\s+|\Z)"
+)
 _DISPLAY_TEMPERATURE_SECTION_RE = re.compile(
     r"(?ims)^###\s*(?:affect_anchor|affect anchor|喜欢它的原因|favorite_reason|favorite reason)\s*$.*?(?=^###\s+|\Z)"
 )
@@ -685,6 +845,22 @@ def strip_affect_anchor(text: str) -> str:
     return _AFFECT_ANCHOR_RE.sub("", str(text)).strip()
 
 
+def strip_followup_sections(text: str) -> str:
+    """Remove followup/todo blocks from ordinary recall text."""
+    if not text:
+        return text
+    return _FOLLOWUP_SECTION_RE.sub("", str(text)).strip()
+
+
+def bucket_content_for_recall(bucket: dict) -> str:
+    """Build bucket body text for ordinary recall/search, excluding task-only blocks."""
+    if not isinstance(bucket, dict):
+        return ""
+    text = strip_wikilinks(str(bucket.get("content") or ""))
+    text = strip_affect_anchor(text)
+    return strip_followup_sections(text).strip()
+
+
 def strip_display_temperature_sections(text: str) -> str:
     """Remove display-only temperature sections from direct bucket rendering."""
     if not text:
@@ -719,7 +895,7 @@ def bucket_text_for_embedding(bucket: dict) -> str:
         meta = {}
 
     title = strip_wikilinks(str(meta.get("name") or "")).strip()
-    body = strip_affect_anchor(strip_wikilinks(str(bucket.get("content") or ""))).strip()
+    body = bucket_content_for_recall(bucket)
 
     parts = []
     if title:

@@ -41,85 +41,17 @@ import jieba
 
 from identity import identity_names
 from memory_relevance import content_terms_for_query, memory_relevance_options_from_config, recall_topic_query
-from utils import generate_bucket_id, sanitize_name, safe_path, now_iso, strip_affect_anchor, strip_wikilinks
+from query_terms import GENERIC_LEXICAL_STOPWORDS
+from utils import (
+    bucket_content_for_recall,
+    generate_bucket_id,
+    now_iso,
+    safe_path,
+    sanitize_name,
+    strip_wikilinks,
+)
 
 logger = logging.getLogger("ombre_brain.bucket")
-
-
-GENERIC_LEXICAL_STOPWORDS = {
-    "一个",
-    "一些",
-    "一下",
-    "不是",
-    "为了",
-    "他们",
-    "你们",
-    "我们",
-    "什么",
-    "今天",
-    "刚才",
-    "刚刚",
-    "这个",
-    "那个",
-    "这些",
-    "那些",
-    "然后",
-    "现在",
-    "自己",
-    "事情",
-    "东西",
-    "内容",
-    "相关",
-    "记忆",
-    "回忆",
-    "总结",
-    "记录",
-    "查询",
-    "搜索",
-    "最近",
-    "之前",
-    "过去",
-    "当前",
-    "安排",
-    "计划",
-    "问题",
-    "目标",
-    "ai_name",
-    "assistant",
-    "display_name",
-    "human_name",
-    "user",
-    "user_alias",
-    "user_aliases",
-    "user_display_name",
-    "user_name",
-    "username",
-    "对方",
-    "用户",
-    "because",
-    "current",
-    "from",
-    "have",
-    "memory",
-    "memories",
-    "recent",
-    "related",
-    "search",
-    "status",
-    "that",
-    "this",
-    "thing",
-    "things",
-    "with",
-    "you",
-    "qq",
-    "q_q",
-    "qaq",
-    "qwq",
-    "qvq",
-    "tt",
-    "t_t",
-}
 
 
 class BucketManager:
@@ -172,6 +104,10 @@ class BucketManager:
         self.w_importance = scoring.get("importance", 1.0)
         self.content_weight = scoring.get("content_weight", 1.0)  # Added to allow better content-based matching during merge
         self.lexical_stop_terms = self._build_lexical_stop_terms(config)
+        self._lexical_profile_cache: dict[
+            str,
+            tuple[tuple, Counter[str], float, tuple[str, str, str, str]],
+        ] = {}
 
     # ---------------------------------------------------------
     # Create a new bucket
@@ -347,7 +283,7 @@ class BucketManager:
     # ---------------------------------------------------------
     # Update bucket
     # 更新桶
-    # Supports: content, tags, importance, valence, arousal, name, resolved
+    # Supports: content, tags, facets, importance, valence, arousal, name, resolved
     # ---------------------------------------------------------
     async def update(self, bucket_id: str, **kwargs) -> bool:
         """
@@ -375,6 +311,8 @@ class BucketManager:
             post.content = kwargs["content"]  # wikilink injection disabled; LLM adds [[]] via prompt
         if "tags" in kwargs:
             post["tags"] = kwargs["tags"]
+        if "facets" in kwargs:
+            post["facets"] = kwargs["facets"] if isinstance(kwargs["facets"], list) else []
         if "importance" in kwargs:
             post["importance"] = max(1, min(10, int(kwargs["importance"])))
         if "domain" in kwargs:
@@ -429,6 +367,16 @@ class BucketManager:
             post["source_persona_event_ids"] = (
                 kwargs["source_persona_event_ids"] if isinstance(kwargs["source_persona_event_ids"], list) else []
             )
+        if "source_conversation_turn_ids" in kwargs:
+            post["source_conversation_turn_ids"] = (
+                kwargs["source_conversation_turn_ids"] if isinstance(kwargs["source_conversation_turn_ids"], list) else []
+            )
+        if "extra_metadata" in kwargs and isinstance(kwargs["extra_metadata"], dict):
+            reserved = {"id", "name", "content", "created", "last_active", "updated_at"}
+            for key, value in kwargs["extra_metadata"].items():
+                if key in reserved or value is None:
+                    continue
+                post[str(key)] = value
 
         # --- Auto-refresh content update time and activation time ---
         # --- 自动刷新内容更新时间与激活时间 ---
@@ -450,6 +398,15 @@ class BucketManager:
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(frontmatter.dumps(post))
             self._move_bucket(file_path, self.permanent_dir, domain)
+        elif "domain" in kwargs and post.get("type") != "feel":
+            bucket_type = str(post.get("type") or "dynamic")
+            if bucket_type == "archived":
+                target_dir = self.archive_dir
+            elif bucket_type == "permanent":
+                target_dir = self.permanent_dir
+            else:
+                target_dir = self.dynamic_dir
+            self._move_bucket(file_path, target_dir, domain)
 
         logger.info(f"Updated bucket / 更新记忆桶: {bucket_id}")
         return True
@@ -459,7 +416,7 @@ class BucketManager:
         bucket_id: str,
         content: str,
         *,
-        author: str = "Haven",
+        author: str | None = None,
         kind: str = "comment",
         valence: float | None = None,
         arousal: float | None = None,
@@ -487,10 +444,11 @@ class BucketManager:
 
         now = now_iso()
         created_at = str(created or now).strip() or now
+        default_author = identity_names(self.config).get("ai_name") or "AI"
         entry = {
             "id": generate_bucket_id(),
             "created": created_at,
-            "author": str(author or "Haven"),
+            "author": str(author or default_author),
             "kind": str(kind or "comment"),
             "content": str(content).strip(),
         }
@@ -1027,15 +985,42 @@ class BucketManager:
         return self._compact_lexical_phrase(text)
 
     def _bucket_searchable_content(self, bucket: dict) -> str:
-        return strip_affect_anchor(strip_wikilinks(str(bucket.get("content", ""))))[:1000]
+        return bucket_content_for_recall(bucket)[:1000]
 
     def _bucket_lexical_profile(self, bucket: dict) -> tuple[Counter[str], float]:
+        _signature, term_frequency, weighted_length, _phrase_fields = self._bucket_lexical_cache_entry(bucket)
+        return term_frequency, weighted_length
+
+    def warm_lexical_profiles(self, buckets: list[dict]) -> int:
+        warmed = 0
+        for bucket in buckets or []:
+            if not isinstance(bucket, dict) or not bucket.get("id"):
+                continue
+            self._bucket_lexical_cache_entry(bucket)
+            warmed += 1
+        return warmed
+
+    def _bucket_lexical_cache_entry(
+        self,
+        bucket: dict,
+    ) -> tuple[tuple, Counter[str], float, tuple[str, str, str, str]]:
         meta = bucket.get("metadata", {}) if isinstance(bucket.get("metadata"), dict) else {}
+        bucket_id = str(bucket.get("id") or meta.get("id") or "")
+        name = str(meta.get("name") or "")
+        domain = " ".join(str(item) for item in meta.get("domain", []) or [])
+        tags = " ".join(str(item) for item in meta.get("tags", []) or [])
+        content = self._bucket_searchable_content(bucket)
+        content_weight = float(self.content_weight or 1.0)
+        signature = (bucket_id, name, domain, tags, content, content_weight)
+        cache_key = bucket_id or f"anonymous:{hash(signature)}"
+        cached = self._lexical_profile_cache.get(cache_key)
+        if cached is not None and cached[0] == signature:
+            return cached
         fields = (
-            ("name", str(meta.get("name") or ""), 3.0),
-            ("domain", " ".join(str(item) for item in meta.get("domain", []) or []), 2.5),
-            ("tags", " ".join(str(item) for item in meta.get("tags", []) or []), 2.0),
-            ("content", self._bucket_searchable_content(bucket), float(self.content_weight or 1.0)),
+            ("name", name, 3.0),
+            ("domain", domain, 2.5),
+            ("tags", tags, 2.0),
+            ("content", content, content_weight),
         )
         term_frequency: Counter[str] = Counter()
         weighted_length = 0.0
@@ -1048,7 +1033,16 @@ class BucketManager:
             for token in tokens:
                 term_frequency[token] += weight
             weighted_length += max(1, len(tokens)) * weight if tokens else 0.0
-        return term_frequency, max(weighted_length, 1.0)
+        value = (
+            signature,
+            term_frequency,
+            max(weighted_length, 1.0),
+            tuple(self._compact_lexical_phrase(text) for _field, text, _weight in fields),
+        )
+        if len(self._lexical_profile_cache) >= 4096:
+            self._lexical_profile_cache.clear()
+        self._lexical_profile_cache[cache_key] = value
+        return value
 
     def _lexical_query_terms(self, query: str) -> list[str]:
         terms = self._lexical_tokens(query)
@@ -1073,16 +1067,10 @@ class BucketManager:
     def _lexical_phrase_boost(self, bucket: dict, query_phrase: str) -> float:
         if not query_phrase or len(query_phrase) < 3:
             return 0.0
-        meta = bucket.get("metadata", {}) if isinstance(bucket.get("metadata"), dict) else {}
-        checks = (
-            (meta.get("name"), 0.95),
-            (" ".join(str(item) for item in meta.get("domain", []) or []), 0.56),
-            (" ".join(str(item) for item in meta.get("tags", []) or []), 0.54),
-            (self._bucket_searchable_content(bucket), 0.48),
-        )
+        _signature, _term_frequency, _weighted_length, phrase_fields = self._bucket_lexical_cache_entry(bucket)
+        checks = zip(phrase_fields, (0.95, 0.56, 0.54, 0.48))
         best = 0.0
-        for value, score in checks:
-            compact = self._compact_lexical_phrase(value)
+        for compact, score in checks:
             if compact and query_phrase in compact:
                 best = max(best, score)
         return best
@@ -1356,6 +1344,8 @@ class BucketManager:
             # Read once, get domain info and update type / 一次性读取
             post = frontmatter.load(file_path)
             domain = post.get("domain", ["未分类"])
+            if not isinstance(domain, list):
+                domain = [domain]
             primary_domain = sanitize_name(domain[0]) if domain else "未分类"
             archive_subdir = os.path.join(self.archive_dir, primary_domain)
             os.makedirs(archive_subdir, exist_ok=True)
@@ -1377,6 +1367,45 @@ class BucketManager:
             return False
 
         logger.info(f"Archived bucket / 归档记忆桶: {bucket_id} → archive/{primary_domain}/")
+        return True
+
+    async def activate(self, bucket_id: str) -> bool:
+        """
+        Move an archived bucket back to dynamic storage and mark it active.
+        将归档桶移回 dynamic，并标为 active。
+        """
+        file_path = self._find_bucket_file(bucket_id)
+        if not file_path:
+            return False
+
+        try:
+            post = frontmatter.load(file_path)
+            domain = post.get("domain", ["未分类"])
+            if not isinstance(domain, list):
+                domain = [domain]
+            primary_domain = sanitize_name(domain[0]) if domain else "未分类"
+            target_dir = os.path.join(self.dynamic_dir, primary_domain)
+            os.makedirs(target_dir, exist_ok=True)
+            dest = safe_path(target_dir, os.path.basename(file_path))
+
+            post["type"] = "dynamic"
+            post["active"] = True
+            post["deprecated"] = False
+            post["resolved"] = False
+            post["updated_at"] = now_iso()
+            post["last_active"] = post.get("last_active") or post["updated_at"]
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(frontmatter.dumps(post))
+
+            if os.path.normpath(file_path) != os.path.normpath(str(dest)):
+                shutil.move(file_path, str(dest))
+        except Exception as e:
+            logger.error(
+                f"Failed to activate bucket / 恢复桶失败: {bucket_id}: {e}"
+            )
+            return False
+
+        logger.info(f"Activated bucket / 恢复记忆桶: {bucket_id} → dynamic/{primary_domain}/")
         return True
 
     # ---------------------------------------------------------
